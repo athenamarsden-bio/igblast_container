@@ -1,6 +1,8 @@
 # AIRU Custom IgBlast Container
 
-This container functions to annotate airr-seq sequences as part of various B-cell analytic pipelines. It automatically pulls data from OGRDB (https://ogrdb.airr-community.org/) during container building
+This container functions to annotate airr-seq sequences as part of various B-cell analytic pipelines. It automatically pulls data from OGRDB (https://ogrdb.airr-community.org/) during container building.
+
+The build process also loads in a run script for ease of use, the usage for the run script is detailed below.
 
 ## Example and Usage
 
