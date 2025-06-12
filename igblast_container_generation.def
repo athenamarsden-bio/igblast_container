@@ -1,200 +1,227 @@
-Bootstrap: docker
-From: ubuntu:latest
+#!/bin/bash
+set -e # Exit immediately if a command exits with a non-zero status.
 
-%labels
-    Maintainer "AI Assistant"
-    Version "2.5" # Ensured script is executable in %post
+# --- Default values ---
+OUTPUT_FILE="/data/igblast_results.tsv"
+THREADS=1
+INPUT_FASTA=""
+ENABLE_EXTEND_5_PRIME=false
+ENABLE_EXTEND_3_PRIME=false
+OUTPUT_FORMAT="7"
+CUSTOM_V_FASTA=""
+CUSTOM_D_FASTA=""
+CUSTOM_J_FASTA=""
+CUSTOM_DB_DIR=""
 
-%environment
-    # Arguments for customization (runtime environment)
-    export RAW_SPECIES="Homo sapiens" # Original species name with spaces
-    export IGBLAST_VERSION="1.22.0"
-    export OGRDB_BASE_DIR="/opt/ogrdb_references"
-    export IGBLAST_INSTALL_DIR="/opt/ncbi-igblast"
+# --- Cleanup function for temp dirs ---
+cleanup() {
+  if [ -n "$CUSTOM_DB_DIR" ]; then
+    rm -rf "$CUSTOM_DB_DIR"
+    echo "Cleaned up temporary database directory."
+  fi
+}
+# Register the cleanup function to be called on script exit
+trap cleanup EXIT
 
-    # Sanitized species name for filenames and DB names (used by runtime script)
-    export BUILT_SPECIES=$(echo "${RAW_SPECIES}" | sed 's/ /_/g') # e.g., Homo_sapiens
+# --- Read necessary environment variables set in Singularity %environment ---
+# RAW_SPECIES (e.g. "Homo sapiens")
+# BUILT_SPECIES (e.g., Homo_sapiens) is used for constructing DB paths.
+# OGRDB_COMBINED_DIR, IGDATA, IGBLAST_VERSION.
+# The script uses these directly from the environment.
 
-    # Set environment variables to avoid interactive prompts
-    export DEBIAN_FRONTEND=noninteractive
+# --- Helper function for usage ---
+usage() {
+  echo "Usage: $(basename "$0") --input <fasta_file> [--output <output_tsv>] [--threads <num>] \\"
+  echo "          [--extend_5_prime] [--extend_3_prime] [--outfmt <format_string>] \\"
+  echo "          [--custom_v_fasta <v_fasta>] [--custom_d_fasta <d_fasta>] [--custom_j_fasta <j_fasta>]"
+  echo ""
+  echo "Arguments:"
+  echo "  --input           : Path to the input FASTA file (required)."
+  echo "  --output          : Path for the output file (default: /data/igblast_results.tsv)."
+  echo "  --threads         : Number of threads for IgBlast (default: 1)."
+  echo "  --extend_5_prime  : Enable 5' V-gene alignment extension (IgBlast -extend_align5end)."
+  echo "  --extend_3_prime  : Enable 3' V-gene alignment extension (IgBlast -extend_align3end)."
+  echo "  --outfmt          : IgBlast output format string (default: \"7\" for AIRR TSV)."
+  echo "                      Examples: \"7\" (AIRR), \"19\" (Extended AIRR with all fields),"
+  echo "                      \"6 qseqid sseqid pident ...\" (custom tabular)."
+  echo "  --custom_v_fasta  : Path to a custom FASTA file for the V-gene database."
+  echo "                      This will override the default OGRDB database."
+  echo "  --custom_d_fasta  : Path to a custom FASTA file for the D-gene database."
+  echo "  --custom_j_fasta  : Path to a custom FASTA file for the J-gene database."
+  echo "  --species_config  : (Info) This script uses IgBlast configured for raw species name: '${RAW_SPECIES}'."
+  echo "                      The germline DB paths are constructed using sanitized name: '${BUILT_SPECIES}'."
+  exit 1
+}
 
-    # Set IgBlast specific environment variables for runtime
-    export IGBLAST_DIR=${IGBLAST_INSTALL_DIR}/${IGBLAST_VERSION}
-    export PATH=${IGBLAST_DIR}/bin:${PATH} # For runtime
-    export IGDATA=${IGBLAST_DIR} 
+# --- Parse command-line arguments ---
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --input) INPUT_FASTA="$2"; shift ;;
+    --output) OUTPUT_FILE="$2"; shift ;;
+    --threads) THREADS="$2"; shift ;;
+    --extend_5_prime) ENABLE_EXTEND_5_PRIME=true ;;
+    --extend_3_prime) ENABLE_EXTEND_3_PRIME=true ;;
+    --outfmt) OUTPUT_FORMAT="$2"; shift ;;
+    --custom_v_fasta) CUSTOM_V_FASTA="$2"; shift ;;
+    --custom_d_fasta) CUSTOM_D_FASTA="$2"; shift ;;
+    --custom_j_fasta) CUSTOM_J_FASTA="$2"; shift ;;
+    --help) usage ;;
+    *) echo "Unknown parameter passed: $1"; usage ;;
+  esac
+  shift
+done
 
-    export OGRDB_SPECIES_DIR="${OGRDB_BASE_DIR}/${BUILT_SPECIES}" # Path now uses underscored species
-    export OGRDB_COMBINED_DIR="${OGRDB_SPECIES_DIR}/OGRDB_Combined"
+# --- Validate input ---
+if [ -z "$INPUT_FASTA" ]; then
+  echo "Error: Input FASTA file (--input) is required."
+  usage
+fi
 
-    # Set a working directory for mounted data at runtime
-    export SINGULARITY_WORKDIR="/data"
+if [ ! -f "$INPUT_FASTA" ]; then
+  echo "Error: Input FASTA file not found at $INPUT_FASTA"
+  exit 1
+fi
 
-%post
-    # Define variables needed during the BUILD process explicitly.
-    BUILD_RAW_SPECIES="Homo sapiens"
-    BUILD_SPECIES_FN=$(echo "${BUILD_RAW_SPECIES}" | sed 's/ /_/g') # Sanitized for filenames
+# Determine IgBlast organism name for -organism flag and for locating auxiliary data file.
+IGBLAST_ORGANISM_NAME_FOR_AUX=$(printf '%s' "${RAW_SPECIES}" | tr '[:upper:]' '[:lower:]' | sed 's/ /_/g')
+IGBLAST_ORGANISM_NAME_FOR_IGBLAST=${IGBLAST_ORGANISM_NAME_FOR_AUX}
 
-    BUILD_IGBLAST_VERSION="1.22.0"
-    BUILD_OGRDB_BASE_DIR="/opt/ogrdb_references"
-    BUILD_IGBLAST_INSTALL_DIR="/opt/ncbi-igblast"
-    BUILD_IGBLAST_DIR="${BUILD_IGBLAST_INSTALL_DIR}/${BUILD_IGBLAST_VERSION}"
-    
-    BUILD_OGRDB_SPECIES_DIR="${BUILD_OGRDB_BASE_DIR}/${BUILD_SPECIES_FN}"
-    BUILD_OGRDB_COMBINED_DIR="${BUILD_OGRDB_SPECIES_DIR}/OGRDB_Combined"
+AUX_FILE_SUFFIX="_gl.aux"
+AUX_DIR_PATH="${IGDATA}/optional_file"
+AUX_FILE_PATH="${AUX_DIR_PATH}/${IGBLAST_ORGANISM_NAME_FOR_AUX}${AUX_FILE_SUFFIX}"
 
-    # Add IgBLAST (and BLAST+) binaries to PATH for the %post script environment
-    export PATH="${BUILD_IGBLAST_DIR}/bin:${PATH}"
-
-    echo "Build-time variables set:"
-    echo "  BUILD_RAW_SPECIES: ${BUILD_RAW_SPECIES}"
-    echo "  BUILD_SPECIES_FN (for paths/filenames): ${BUILD_SPECIES_FN}"
-    echo "  BUILD_IGBLAST_VERSION: ${BUILD_IGBLAST_VERSION}"
-    echo "  BUILD_IGBLAST_DIR: ${BUILD_IGBLAST_DIR}"
-    echo "  BUILD_OGRDB_COMBINED_DIR: ${BUILD_OGRDB_COMBINED_DIR}"
-    echo "  Build-time PATH updated to: ${PATH}"
-
-    echo "Starting package installation..."
-    apt-get update -qq
-    apt-get install -y --no-install-recommends \
-        wget \
-        tar \
-        gzip \
-        python3 \
-        python3-pip \
-        python3-venv \
-        ca-certificates \
-        build-essential \
-        gawk
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-    echo "Package installation complete."
-
-    echo "Installing IgBlast version ${BUILD_IGBLAST_VERSION} to ${BUILD_IGBLAST_DIR}..."
-    mkdir -p "${BUILD_IGBLAST_DIR}"
-    cd /tmp
-    wget --quiet "https://ftp.ncbi.nih.gov/blast/executables/igblast/release/${BUILD_IGBLAST_VERSION}/ncbi-igblast-${BUILD_IGBLAST_VERSION}-x64-linux.tar.gz" -O ncbi-igblast.tar.gz || \
-    wget --quiet "https://ftp.ncbi.nih.gov/blast/executables/igblast/release/LATEST/ncbi-igblast-${BUILD_IGBLAST_VERSION}-x64-linux.tar.gz" -O ncbi-igblast.tar.gz
-    tar -zxvf ncbi-igblast.tar.gz -C "${BUILD_IGBLAST_DIR}" --strip-components=1
-    rm ncbi-igblast.tar.gz
-    echo "IgBlast installation complete."
-
-    echo "Installing receptor-utils..."
-    pip3 install --no-cache-dir --quiet --break-system-packages receptor-utils
-    echo "receptor-utils installation complete."
-
-    echo "Creating OGRDB combined directory for species ${BUILD_SPECIES_FN} at ${BUILD_OGRDB_COMBINED_DIR}..."
-    mkdir -p "${BUILD_OGRDB_COMBINED_DIR}"
-    echo "OGRDB combined directory creation complete."
-
-    echo "Downloading and combining OGRDB reference sequences for ${BUILD_RAW_SPECIES} (using ${BUILD_SPECIES_FN} for filenames)..."
-
-    BUILD_COMBINED_V_FASTA_FILENAME="${BUILD_SPECIES_FN}_OGRDB_V.fasta"
-    BUILD_COMBINED_J_FASTA_FILENAME="${BUILD_SPECIES_FN}_OGRDB_J.fasta"
-    BUILD_COMBINED_D_FASTA_FILENAME="${BUILD_SPECIES_FN}_OGRDB_D.fasta"
-
-    BUILD_COMBINED_V_FASTA_FULLPATH="${BUILD_OGRDB_COMBINED_DIR}/${BUILD_COMBINED_V_FASTA_FILENAME}"
-    BUILD_COMBINED_J_FASTA_FULLPATH="${BUILD_OGRDB_COMBINED_DIR}/${BUILD_COMBINED_J_FASTA_FILENAME}"
-    BUILD_COMBINED_D_FASTA_FULLPATH="${BUILD_OGRDB_COMBINED_DIR}/${BUILD_COMBINED_D_FASTA_FILENAME}"
-
-    > "${BUILD_COMBINED_V_FASTA_FULLPATH}"
-    > "${BUILD_COMBINED_J_FASTA_FULLPATH}"
-    > "${BUILD_COMBINED_D_FASTA_FULLPATH}"
-
-    TEMP_IGH_DL_PREFIX="${BUILD_OGRDB_COMBINED_DIR}/temp_${BUILD_SPECIES_FN}_IGH"
-    TEMP_IGK_DL_PREFIX="${BUILD_OGRDB_COMBINED_DIR}/temp_${BUILD_SPECIES_FN}_IGK"
-    TEMP_IGL_DL_PREFIX="${BUILD_OGRDB_COMBINED_DIR}/temp_${BUILD_SPECIES_FN}_IGL"
-
-    TEMP_IGH_FASTA="${TEMP_IGH_DL_PREFIX}gapped.fasta"
-    TEMP_IGK_FASTA="${TEMP_IGK_DL_PREFIX}gapped.fasta"
-    TEMP_IGL_FASTA="${TEMP_IGL_DL_PREFIX}gapped.fasta"
-
-    echo "Downloading IGH locus for ${BUILD_RAW_SPECIES}..."
-    download_germline_set "${BUILD_RAW_SPECIES}" IGH -f SINGLE-FU -p "${TEMP_IGH_DL_PREFIX}"
-    echo "Downloading IGK locus for ${BUILD_RAW_SPECIES}..."
-    download_germline_set "${BUILD_RAW_SPECIES}" IGK -f SINGLE-FU -p "${TEMP_IGK_DL_PREFIX}"
-    echo "Downloading IGL locus for ${BUILD_RAW_SPECIES}..."
-    download_germline_set "${BUILD_RAW_SPECIES}" IGL -f SINGLE-FU -p "${TEMP_IGL_DL_PREFIX}"
-
-    echo "Parsing and combining V, D, J genes..."
-    for locus_file in "${TEMP_IGH_FASTA}" "${TEMP_IGK_FASTA}" "${TEMP_IGL_FASTA}"; do
-        if [ -f "${locus_file}" ]; then
-            echo "Processing ${locus_file}..."
-            awk 'BEGIN {RS = ">" ; FS = "\n" ; ORS = ""} NR > 0 {header = $1; sequence = ""; for (i=2; i<=NF; i++) sequence = sequence $i; if (header ~ /^IGHV/ || header ~ /^IGKV/ || header ~ /^IGLV/) { print ">"header"\n"sequence"\n" } }' "${locus_file}" >> "${BUILD_COMBINED_V_FASTA_FULLPATH}"
-            awk 'BEGIN {RS = ">" ; FS = "\n" ; ORS = ""} NR > 0 {header = $1; sequence = ""; for (i=2; i<=NF; i++) sequence = sequence $i; if (header ~ /^IGHD/) { print ">"header"\n"sequence"\n" } }' "${locus_file}" >> "${BUILD_COMBINED_D_FASTA_FULLPATH}"
-            awk 'BEGIN {RS = ">" ; FS = "\n" ; ORS = ""} NR > 0 {header = $1; sequence = ""; for (i=2; i<=NF; i++) sequence = sequence $i; if (header ~ /^IGHJ/ || header ~ /^IGKJ/ || header ~ /^IGLJ/) { print ">"header"\n"sequence"\n" } }' "${locus_file}" >> "${BUILD_COMBINED_J_FASTA_FULLPATH}"
-            rm "${locus_file}"
-        else
-            echo "Warning: Locus file ${locus_file} not found after download attempt."
-        fi
-    done
-    echo "OGRDB download and combination complete."
-
-    echo "Preparing BLAST databases from combined OGRDB FASTA files..."
-    ORIGINAL_PWD=$(pwd)
-    cd "${BUILD_OGRDB_COMBINED_DIR}"
-
-    if [ -s "${BUILD_COMBINED_V_FASTA_FILENAME}" ]; then 
-        DB_V_OUT_BASENAME=$(basename "${BUILD_COMBINED_V_FASTA_FILENAME}" .fasta)
-        echo "Creating BLAST DB for V genes. Input: ${BUILD_COMBINED_V_FASTA_FILENAME}, Output base in current dir: ${DB_V_OUT_BASENAME}"
-        makeblastdb -in "${BUILD_COMBINED_V_FASTA_FILENAME}" -dbtype nucl -parse_seqids -out "${DB_V_OUT_BASENAME}"
-    else 
-        echo "Warning: ${BUILD_COMBINED_V_FASTA_FILENAME} is empty or not found. Skipping makeblastdb."
-    fi
-
-    if [ -s "${BUILD_COMBINED_J_FASTA_FILENAME}" ]; then 
-        DB_J_OUT_BASENAME=$(basename "${BUILD_COMBINED_J_FASTA_FILENAME}" .fasta)
-        echo "Creating BLAST DB for J genes. Input: ${BUILD_COMBINED_J_FASTA_FILENAME}, Output base in current dir: ${DB_J_OUT_BASENAME}"
-        makeblastdb -in "${BUILD_COMBINED_J_FASTA_FILENAME}" -dbtype nucl -parse_seqids -out "${DB_J_OUT_BASENAME}"
-    else 
-        echo "Warning: ${BUILD_COMBINED_J_FASTA_FILENAME} is empty or not found. Skipping makeblastdb."
-    fi
-
-    if [ -s "${BUILD_COMBINED_D_FASTA_FILENAME}" ]; then 
-        DB_D_OUT_BASENAME=$(basename "${BUILD_COMBINED_D_FASTA_FILENAME}" .fasta)
-        echo "Creating BLAST DB for D genes. Input: ${BUILD_COMBINED_D_FASTA_FILENAME}, Output base in current dir: ${DB_D_OUT_BASENAME}"
-        makeblastdb -in "${BUILD_COMBINED_D_FASTA_FILENAME}" -dbtype nucl -parse_seqids -out "${DB_D_OUT_BASENAME}"
-    else 
-        echo "Warning: ${BUILD_COMBINED_D_FASTA_FILENAME} is empty or not found. Skipping makeblastdb."
-    fi
-    
-    cd "${ORIGINAL_PWD}" 
-    echo "BLAST database preparation complete."
-
-    # The run_igblast_custom.sh script is copied by %files.
-    # Explicitly set execute permissions here in %post as a safeguard.
-    # The file path /usr/local/bin/run_igblast_custom.sh is where %files copies it.
-    if [ -f /usr/local/bin/run_igblast_custom.sh ]; then
-       chmod +x /usr/local/bin/run_igblast_custom.sh
-       echo "Permissions explicitly set for /usr/local/bin/run_igblast_custom.sh in %post."
+if [ ! -d "${IGDATA}" ]; then
+    echo "Error: IGDATA directory not found at ${IGDATA}. This should be set by the Singularity container environment."
+    exit 1
+fi
+if [ ! -d "${AUX_DIR_PATH}" ]; then
+    ALT_AUX_DIR_PATH="${IGDATA}/internal_data/optional_file"
+    if [ -d "${ALT_AUX_DIR_PATH}" ]; then
+        AUX_DIR_PATH="${ALT_AUX_DIR_PATH}"
+        AUX_FILE_PATH="${AUX_DIR_PATH}/${IGBLAST_ORGANISM_NAME_FOR_AUX}${AUX_FILE_SUFFIX}"
     else
-       # This case should ideally not happen if %files is correctly defined and the source file exists.
-       echo "Warning: /usr/local/bin/run_igblast_custom.sh not found in %post to set permissions."
-       echo "Ensure 'run_igblast_custom.sh' is in your build context and %files section is correct."
-    fi
-
-    mkdir -p /data 
-    echo "Singularity setup complete. Current date: $(date)"
-
-%files
-    # Copy the entrypoint script into the image
-    # Source path is relative to the build context (where you run `singularity build`)
-    # Destination path is inside the container
-    run_igblast_custom.sh /usr/local/bin/run_igblast_custom.sh
-
-%runscript
-    # This script executes when the container is run.
-    # The environment variables from %environment are available here.
-    echo "Executing run_igblast_custom.sh with arguments: $@"
-    # The check for executability is still useful for debugging, but %post should now handle it.
-    if [ ! -x /usr/local/bin/run_igblast_custom.sh ]; then
-        echo "Error: /usr/local/bin/run_igblast_custom.sh is not executable despite %post chmod."
-        echo "This indicates a deeper issue with the build or filesystem permissions."
+        echo "Error: Neither ${IGDATA}/optional_file nor ${IGDATA}/internal_data/optional_file exist. Cannot find auxiliary data directory."
         exit 1
     fi
-    
-    if [ $# -eq 0 ]; then
-        /usr/local/bin/run_igblast_custom.sh --help
-    else
-        /usr/local/bin/run_igblast_custom.sh "$@"
-    fi
+fi
 
+if [ ! -f "$AUX_FILE_PATH" ]; then
+    IGBLAST_ORGANISM_NAME_FIRST_WORD=$(printf '%s' "${RAW_SPECIES}" | tr '[:upper:]' '[:lower:]' | cut -d' ' -f1)
+    AUX_FILE_PATH_FIRST_WORD="${AUX_DIR_PATH}/${IGBLAST_ORGANISM_NAME_FIRST_WORD}${AUX_FILE_SUFFIX}"
+    if [ -f "$AUX_FILE_PATH_FIRST_WORD" ]; then
+        AUX_FILE_PATH="$AUX_FILE_PATH_FIRST_WORD"
+        IGBLAST_ORGANISM_NAME_FOR_IGBLAST=${IGBLAST_ORGANISM_NAME_FIRST_WORD}
+    else
+        if [ "$BUILT_SPECIES" == "Homo_sapiens" ] && [ -f "${AUX_DIR_PATH}/human_gl.aux" ]; then
+            AUX_FILE_PATH="${AUX_DIR_PATH}/human_gl.aux"
+            IGBLAST_ORGANISM_NAME_FOR_IGBLAST="human"
+        elif [ "$BUILT_SPECIES" == "Mus_musculus" ] && [ -f "${AUX_DIR_PATH}/mouse_gl.aux" ]; then
+             AUX_FILE_PATH="${AUX_DIR_PATH}/mouse_gl.aux"
+             IGBLAST_ORGANISM_NAME_FOR_IGBLAST="mouse"
+        else
+            echo "Error: Cannot find auxiliary file. Tried:"
+            echo "  ${AUX_FILE_PATH} (derived from ${IGBLAST_ORGANISM_NAME_FOR_AUX})"
+            echo "  ${AUX_FILE_PATH_FIRST_WORD} (derived from ${IGBLAST_ORGANISM_NAME_FIRST_WORD})"
+            echo "Exiting."
+            exit 1
+        fi
+    fi
+fi
+
+echo "--- Preparing IgBlast Databases ---"
+
+# --- Define paths to FASTA files (for validation) and BLAST DB base names (for igblastn) ---
+# OGRDB_COMBINED_DIR and BUILT_SPECIES (e.g. Homo_sapiens) are from Singularity %environment
+
+# Default OGRDB paths
+DB_V_BLAST_BASE="${OGRDB_COMBINED_DIR}/${BUILT_SPECIES}_OGRDB_V"
+DB_J_BLAST_BASE="${OGRDB_COMBINED_DIR}/${BUILT_SPECIES}_OGRDB_J"
+DB_D_BLAST_BASE="${OGRDB_COMBINED_DIR}/${BUILT_SPECIES}_OGRDB_D"
+
+DB_V_FASTA_PATH="${OGRDB_COMBINED_DIR}/${BUILT_SPECIES}_OGRDB_V.fasta"
+DB_J_FASTA_PATH="${OGRDB_COMBINED_DIR}/${BUILT_SPECIES}_OGRDB_J.fasta"
+DB_D_FASTA_PATH="${OGRDB_COMBINED_DIR}/${BUILT_SPECIES}_OGRDB_D.fasta"
+
+# --- Handle Custom Databases ---
+# If any custom FASTA is provided, create a temporary directory for the BLAST DBs
+if [ -n "$CUSTOM_V_FASTA" ] || [ -n "$CUSTOM_D_FASTA" ] || [ -n "$CUSTOM_J_FASTA" ]; then
+  CUSTOM_DB_DIR=$(mktemp -d)
+  echo "Created temporary directory for custom databases: ${CUSTOM_DB_DIR}"
+fi
+
+if [ -n "$CUSTOM_V_FASTA" ]; then
+  if [ ! -f "$CUSTOM_V_FASTA" ]; then echo "Error: Custom V-gene FASTA not found: $CUSTOM_V_FASTA"; exit 1; fi
+  echo "Creating custom V-gene BLAST database from $CUSTOM_V_FASTA"
+  DB_V_BLAST_BASE="${CUSTOM_DB_DIR}/custom_v_db"
+  makeblastdb -in "$CUSTOM_V_FASTA" -dbtype nucl -parse_seqids -out "$DB_V_BLAST_BASE" -title "Custom V DB"
+fi
+
+if [ -n "$CUSTOM_D_FASTA" ]; then
+  if [ ! -f "$CUSTOM_D_FASTA" ]; then echo "Error: Custom D-gene FASTA not found: $CUSTOM_D_FASTA"; exit 1; fi
+  echo "Creating custom D-gene BLAST database from $CUSTOM_D_FASTA"
+  DB_D_BLAST_BASE="${CUSTOM_DB_DIR}/custom_d_db"
+  makeblastdb -in "$CUSTOM_D_FASTA" -dbtype nucl -parse_seqids -out "$DB_D_BLAST_BASE" -title "Custom D DB"
+fi
+
+if [ -n "$CUSTOM_J_FASTA" ]; then
+  if [ ! -f "$CUSTOM_J_FASTA" ]; then echo "Error: Custom J-gene FASTA not found: $CUSTOM_J_FASTA"; exit 1; fi
+  echo "Creating custom J-gene BLAST database from $CUSTOM_J_FASTA"
+  DB_J_BLAST_BASE="${CUSTOM_DB_DIR}/custom_j_db"
+  makeblastdb -in "$CUSTOM_J_FASTA" -dbtype nucl -parse_seqids -out "$DB_J_BLAST_BASE" -title "Custom J DB"
+fi
+
+
+# --- Validate FASTA database files (source files for BLAST DBs) ---
+# Skip validation if a custom database was provided for that gene type
+if [ -z "$CUSTOM_V_FASTA" ] && [ ! -s "$DB_V_FASTA_PATH" ]; then echo "Error: Source V-gene FASTA DB is empty or not found: $DB_V_FASTA_PATH"; exit 1; fi
+if [ -z "$CUSTOM_J_FASTA" ] && [ ! -s "$DB_J_FASTA_PATH" ]; then echo "Error: Source J-gene FASTA DB is empty or not found: $DB_J_FASTA_PATH"; exit 1; fi
+# For D-gene, it's a warning, not an error.
+if [ -z "$CUSTOM_D_FASTA" ] && [ ! -s "$DB_D_FASTA_PATH" ]; then
+    echo "Warning: Source D-gene FASTA DB is empty or not found: $DB_D_FASTA_PATH. This is okay if not analyzing IGH or if D genes are not used."
+fi
+
+
+echo "--- Running IgBlast ---"
+echo "Species (configured for filenames): ${BUILT_SPECIES}"
+echo "IgBlast Organism Name (for -organism and aux data): ${IGBLAST_ORGANISM_NAME_FOR_IGBLAST}"
+echo "Input FASTA: ${INPUT_FASTA}"
+echo "Output File: ${OUTPUT_FILE}"
+echo "Output Format: ${OUTPUT_FORMAT}"
+echo "Threads: ${THREADS}"
+echo "5' V-gene extension enabled: ${ENABLE_EXTEND_5_PRIME}"
+echo "3' V-gene extension enabled: ${ENABLE_EXTEND_3_PRIME}"
+echo "Auxiliary data file: ${AUX_FILE_PATH}"
+echo "V-gene DB: ${DB_V_BLAST_BASE}"
+echo "D-gene DB: ${DB_D_BLAST_BASE}"
+echo "J-gene DB: ${DB_J_BLAST_BASE}"
+echo "OGRDB Combined Directory: ${OGRDB_COMBINED_DIR}"
+echo "IGDATA Path: ${IGDATA}"
+echo "IgBlast Version (runtime): ${IGBLAST_VERSION}"
+
+IGBLAST_ARGS=()
+# Only add -germline_db_D if the D gene FASTA file exists/was provided and is not empty
+if [ -n "$CUSTOM_D_FASTA" ] || [ -s "$DB_D_FASTA_PATH" ]; then
+    IGBLAST_ARGS+=("-germline_db_D" "$DB_D_BLAST_BASE")
+fi
+if [ ! -f "$AUX_FILE_PATH" ]; then echo "Error: Auxiliary data file not found: $AUX_FILE_PATH"; exit 1; fi
+
+if [ "$ENABLE_EXTEND_5_PRIME" = true ]; then
+  IGBLAST_ARGS+=("-extend_align5end")
+fi
+if [ "$ENABLE_EXTEND_3_PRIME" = true ]; then
+  IGBLAST_ARGS+=("-extend_align3end")
+fi
+
+echo "Running IgBlast command..."
+igblastn -ig_seqtype Ig \
+  -germline_db_V "$DB_V_BLAST_BASE" \
+  "${IGBLAST_ARGS[@]}" \
+  -germline_db_J "$DB_J_BLAST_BASE" \
+  -auxiliary_data "$AUX_FILE_PATH" \
+  -organism "${IGBLAST_ORGANISM_NAME_FOR_IGBLAST}" \
+  -query "$INPUT_FASTA" \
+  -out "$OUTPUT_FILE" \
+  -outfmt "${OUTPUT_FORMAT}" \
+  -num_threads "${THREADS}"
+
+echo "--- IgBlast processing complete. Output at: ${OUTPUT_FILE} ---"
