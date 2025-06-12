@@ -21,7 +21,8 @@ singularity run path/to/igblast_custom.sif/ \
 
 ```
 Usage: run_igblast_custom.sh --input <fasta_file> [--output <output_tsv>] [--threads <num>] \
-          [--extend_5_prime] [--extend_3_prime] [--outfmt <format_string>]
+          [--extend_5_prime] [--extend_3_prime] [--outfmt <format_string>] \
+          [--custom_v_fasta <v_fasta>] [--custom_d_fasta <d_fasta>] [--custom_j_fasta <j_fasta>]
 
 Arguments:
   --input           : Path to the input FASTA file (required).
